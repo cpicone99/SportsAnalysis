@@ -1,0 +1,892 @@
+---
+title: "STAT 1341 Final Project"
+author: "Celeste Picone"
+date: "11/16/2021"
+output: html_document
+---
+
+Read in datat and create wins
+```{r}
+library(dplyr)
+# Look at the 2007 season because that is when the Patriots lost to an underdog and 5th seed in the superbowl.
+simulated_season=2007
+
+# Read in initial elos
+team_info<-read.csv("/Users/celestepicone/Downloads/nfl_initial_elos.csv",header=TRUE)
+
+scores<- read.csv("/Users/celestepicone/Downloads/nfl_scores.csv", header=TRUE, row.names="id")
+
+conferences = na.omit(unique(team_info$conference))
+divisions = na.omit(unique(team_info$division))
+
+pre_season = scores[which(scores$season < simulated_season & scores$season >= 1901),]
+
+season_schedule = scores[which(scores$season == simulated_season & scores$game_type == "r"),]
+
+# Create total wins for 2007
+for(i in 1:nrow(season_schedule)) {
+  if(season_schedule$home_score[i] > season_schedule$away_score[i]) { 
+    season_schedule$home.win[i] = 1  
+  } else if(season_schedule$home_score[i] < season_schedule$away_score[i]) { 
+     season_schedule$home.win[i]  = 0  }
+  else { 
+    season_schedule$home.win[i] = 0.5  
+  }}
+for(i in 1:nrow(season_schedule)) {
+  if(season_schedule$away_score[i] > season_schedule$home_score[i]) { 
+    season_schedule$away.win[i] = 1  
+  } else if(season_schedule$away_score[i] < season_schedule$home_score[i]) { 
+     season_schedule$away.win[i]  = 0  }
+  else { 
+    season_schedule$away.win[i] = 0.5  
+  }}
+home.win.df<-season_schedule%>%
+  select(home_team,home.win)
+away.win.df<-season_schedule%>%
+  select(away_team,away.win)
+
+# Make a data frame and select what info we want for the wins
+sum.home.wins<-aggregate(.~home_team,data=home.win.df,FUN=sum)
+sum.away.wins<-aggregate(.~away_team,data=away.win.df,FUN=sum)
+total.wins<-cbind(sum.away.wins,sum.home.wins)
+total.wins<-total.wins%>%
+  mutate(actual_wins=home.win+away.win)%>%
+  select(home_team,actual_wins)%>%
+  rename(team=home_team)
+```
+
+
+Initial Elos
+```{r}
+# Choose weight and home field advantage specified in lecture 18
+weight = 18.3 
+hfa = 54.87
+
+# Go through the games that were played before the season we are interested in
+for(i in 1:nrow(pre_season)) {
+# Specify home and away teams
+  home_index = which(team_info$team == pre_season$home_team[i])
+  away_index = which(team_info$team == pre_season$away_team[i])
+# Determine elo ratings for each team 
+  home_elo = team_info$rating[home_index]
+  away_elo = team_info$rating[away_index]
+
+# Calculate win prob for home team  
+  win_prob = 1 / (10^((away_elo - (home_elo + hfa*pre_season$neutral[i]))/400) + 1)
+
+# Calculate score difference (make it positive)
+  score_diff = abs(pre_season$home_score[i] - pre_season$away_score[i])   
+  
+# Find result with respect to home team
+  if(pre_season$home_score[i] > pre_season$away_score[i]) { 
+    home_result = 1  
+  } else if(pre_season$home_score[i] < pre_season$away_score[i]) { 
+    home_result = 0  
+  } else { 
+    home_result = 0.5  
+  }
+
+  # Elo adjustment 
+  home_elo_adjustment = weight * log(score_diff + 1) * (home_result - win_prob)
+  
+  # Adjust elos 
+  team_info$rating[home_index] = team_info$rating[home_index] + home_elo_adjustment
+  team_info$rating[away_index] = team_info$rating[away_index] - home_elo_adjustment
+  
+  # Regress ratings 1/3 of the way back to 1500
+  if(i < nrow(scores) && scores$season[i+1] > scores$season[i]) {
+    for(j in 1:nrow(team_info)) {
+      if(scores$season[i] >= team_info$inaugural_season[j]) {
+        team_info$rating[j] = team_info$rating[j] - (team_info$rating[j] - 1500)/3
+      }
+    }
+    
+    existing_teams = team_info[which(team_info$inaugural_season <= (scores$season[i] + 1)),]
+    
+# Calculate the number that must be used to adjust all teams' elos, so that the mean is 1500  
+    expansion_adjustment = -1*(mean(existing_teams$rating) - 1500)
+    
+  # Use expansion adjustment for existing teams
+    for(j in 1:nrow(team_info)) {
+      if((scores$season[i] + 1) >= team_info$inaugural_season[j]) {
+        team_info$rating[j] = team_info$rating[j] + expansion_adjustment
+      }
+    }
+  }
+}
+# Select info we are interested in
+initial.elos<-team_info%>%
+  select(team,rating,division,conference)
+initial.elos%>%
+  group_by(conference)%>%
+  arrange(desc(rating),.by_group = TRUE)
+```
+
+
+Simulation
+```{r}
+
+set.seed(9)
+
+# Number of times to simulate
+iterations = 10000
+
+# Make empty data frame for results
+summary = data.frame(matrix(0, ncol = 6, nrow = nrow(team_info)))
+colnames(summary) = c("team", "average_wins", "playoffs", "division_titles", "conf_champ", "championships")
+summary$team = team_info$team
+
+# Make empty data frame for number of wins in each iteration
+histories = data.frame(matrix(0, ncol = nrow(team_info), nrow = iterations))
+colnames(histories) = team_info$team
+
+# Simulate season
+for(i in 1:iterations) {
+  season_stats = team_info[,which(colnames(team_info) != "inaugural_season")]
+  season_stats$wins = 0
+  season_stats$rand = runif(nrow(team_info))
+  
+# Simulate each game
+  for(j in 1:nrow(season_schedule)) {
+
+    home_index = which(season_stats$team == season_schedule$home_team[j])
+    away_index = which(season_stats$team == season_schedule$away_team[j])
+
+# Home and away elo ratings
+    home_elo = season_stats$rating[home_index]
+    away_elo = season_stats$rating[away_index]
+
+# Calculate win probability for home team    
+    win_prob = 1 / (10^((away_elo - (home_elo + hfa*season_schedule$neutral[j]))/400) + 1)
+    u = runif(1) # Randomize winner
+ 
+  # add win to teams win total   
+    if(u < win_prob) {
+      season_stats$wins[home_index] = season_stats$wins[home_index] + 1
+    } else {
+      season_stats$wins[away_index] = season_stats$wins[away_index] + 1
+    }
+
+    # Calculate score diff
+    score_diff = abs(season_schedule$home_score[j] - season_schedule$away_score[j])   
+
+    if(season_schedule$home_score[j] > season_schedule$away_score[j]) { 
+      home_result = 1 
+    } else if(season_schedule$home_score[j] < season_schedule$away_score[j]) { 
+      home_result = 0
+    } else { 
+      home_result = 0.5
+    }
+
+  # Number to adjust elo by
+    home_elo_adjustment = weight * log(score_diff + 1) * (home_result - win_prob)
+
+    # Adjust elos
+    season_stats$rating[home_index] = season_stats$rating[home_index] + home_elo_adjustment
+    season_stats$rating[away_index] = season_stats$rating[away_index] - home_elo_adjustment
+  }
+
+  # Add wins to summary data frame
+  summary$average_wins = summary$average_wins + season_stats$wins
+  
+# Create empty data frame for divison winners
+  division_winners = data.frame(matrix(ncol = 6, nrow = 0))
+  colnames(division_winners) = c("team", "conference", "division", "rating", "wins", "rand")
+
+  # Create empty data frame for non-divison winners
+  non_division_winners = data.frame(matrix(ncol = 6, nrow = 0))
+  colnames(non_division_winners) = c("team", "conference", "division", "rating", "wins", "rand")
+
+  # Create empty data frame for wild card teams
+  num_wild_cards = 2
+  wild_card_teams = data.frame(matrix(ncol = 6, nrow = 0))
+  colnames(wild_card_teams) = c("team", "conference", "division", "rating", "wins", "rand")
+
+  # Complete for each division
+  for(div in divisions) {
+    div_standings = season_stats[which(season_stats$division == div),] 
+    #All teams in current division
+    div_standings = div_standings[order(-div_standings$wins, -div_standings$rand),]  
+    #sort
+    division_winners = rbind(division_winners, div_standings[1,]) 
+    non_division_winners = rbind(non_division_winners, div_standings[2:nrow(div_standings),])  
+
+  }
+ # Complete for each conference
+  for(conference in conferences) {
+    wc_standings = non_division_winners[which(non_division_winners$conference == conference),]
+
+    wc_standings = wc_standings[order(-wc_standings$wins, -wc_standings$rand),] 
+    wild_card_teams = rbind(wild_card_teams, wc_standings[1:num_wild_cards,])  
+  }
+
+  # sort winners and wildcards
+  division_winners = division_winners[order(division_winners$conference, -division_winners$wins, -division_winners$rand),]
+  wild_card_teams = wild_card_teams[order(wild_card_teams$conference, -wild_card_teams$wins, -wild_card_teams$rand),]
+
+  # add to the number of division titles and playoff appearances for the division winners (+1)
+  for(team in division_winners$team) {
+    index = which(season_stats$team == team)  
+    summary$playoffs[index] = summary$playoffs[index] + 1  
+    summary$division_titles[index] = summary$division_titles[index] + 1  
+  }
+  
+ # add to the number of playoff appearances for the wild card teams (+1)
+  for(team in wild_card_teams$team) {
+    index = which(season_stats$team == team) 
+    summary$playoffs[index] = summary$playoffs[index] + 1  
+  }
+  
+  # make playoff brackets
+  playoff_bracket = data.frame(matrix(-Inf, ncol = 6, nrow = 16))
+  colnames(playoff_bracket) = c("team", "conference", "division", "rating", "wins", "rand")
+  next_round = NULL
+  
+# Bracket for nfl
+  playoff_bracket[1,] = division_winners[1,]
+  playoff_bracket[2,] = division_winners[2,]
+  playoff_bracket[3,] = division_winners[3,]
+  playoff_bracket[4,] = division_winners[4,]
+  playoff_bracket[5,] = wild_card_teams[1,]
+  playoff_bracket[6,] = wild_card_teams[2,]
+  playoff_bracket[9,] = division_winners[5,]
+  playoff_bracket[10,] = division_winners[6,]
+  playoff_bracket[11,] = division_winners[7,]
+  playoff_bracket[12,] = division_winners[8,]
+  playoff_bracket[13,] = wild_card_teams[3,]
+  playoff_bracket[14,] = wild_card_teams[4,]
+
+ #change seed 
+   playoff_bracket$seed = rep(1:8,2)  
+  games_per_round = c(1, 1, 1, 1)
+  reseed = TRUE
+
+  # simulate until championship round
+  for(round in 1:(length(games_per_round)-1)) {
+    for(j in 1:2) { 
+      for(k in 1:(nrow(playoff_bracket)/4)) { 
+        high_seed_index = 0.5*nrow(playoff_bracket)*j-(0.5*nrow(playoff_bracket)-k)
+        low_seed_index = 0.5*nrow(playoff_bracket)*j-(k-1)
+
+        #get elos for high and low seeds
+        high_seed_elo = playoff_bracket$rating[high_seed_index]
+        low_seed_elo = playoff_bracket$rating[low_seed_index]
+
+        #find win probability for each team playing at home against opponent
+        high_seed_home_win_prob = 1 / (10^((low_seed_elo - (high_seed_elo + hfa))/400) + 1)
+        low_seed_home_win_prob = 1 / (10^((high_seed_elo - (low_seed_elo + hfa))/400) + 1)
+        #make array of the probabilities where high seed gets 1 more game at home
+        win_probs = c(rep(high_seed_home_win_prob, ceiling(games_per_round[round]/2)), 1-rep(low_seed_home_win_prob, floor(games_per_round[round]/2)))
+        
+        u = runif(games_per_round[round])  
+        #generate random numbers
+        high_seed_wins = sum(u < win_probs)/games_per_round[round]  #proportion of games won by high seed
+    
+        if(high_seed_wins > 0.50) {  
+          next_round = rbind(next_round, playoff_bracket[high_seed_index,]) 
+        } else{ 
+          next_round = rbind(next_round, playoff_bracket[low_seed_index,]) 
+        }
+      }
+    }
+    
+    playoff_bracket = next_round  
+  
+    #Reseed after each round
+    if(reseed) {  
+      playoff_bracket = playoff_bracket[order(playoff_bracket$conference, playoff_bracket$seed),]  
+    } else {  
+      if(nrow(playoff_bracket) >= 4) {   
+        for(j in 1:2) {
+          for(k in 1:(nrow(playoff_bracket)/4)) {
+            index_1 = 0.5*nrow(playoff_bracket)*j-(0.5*nrow(playoff_bracket)-k)
+            index_2 = 0.5*nrow(playoff_bracket)*j-(k-1)
+            if(playoff_bracket$seed[index_1] > playoff_bracket$seed[index_2]) {
+              temp = playoff_bracket[index_1,]
+              playoff_bracket[index_1,] = playoff_bracket[index_2,]
+              playoff_bracket[index_2,] = temp
+            }
+          }
+        }
+      }
+    }
+    # reset list of teams in nect round to be empty data frame
+    next_round = NULL 
+  }
+  
+  #super bowl has no home field advantage
+  hfa = 0 
+  playoff_bracket = playoff_bracket[order(-playoff_bracket$wins, -playoff_bracket$rand),]
+  
+  # repeat for champtionship
+  high_seed_elo = playoff_bracket$rating[1]
+  low_seed_elo = playoff_bracket$rating[2]
+  high_seed_home_win_prob = 1 / (10^((low_seed_elo - (high_seed_elo + hfa))/400) + 1)
+  low_seed_home_win_prob = 1 / (10^((high_seed_elo - (low_seed_elo + hfa))/400) + 1)
+  win_probs = c(rep(high_seed_home_win_prob, ceiling(games_per_round[length(games_per_round)]/2)), 1-rep(low_seed_home_win_prob, floor(games_per_round[length(games_per_round)]/2)))
+  u = runif(games_per_round[length(games_per_round)])
+  high_seed_wins = sum(u < win_probs)/games_per_round[length(games_per_round)]
+  
+  if(high_seed_wins > 0.50) {  
+    champion = playoff_bracket[1,]
+  } else{  
+    champion = playoff_bracket[2,]
+  }
+
+# add to the number of conference championships won (+1)
+  for(team in playoff_bracket$team) {
+    index = which(season_stats$team == team)
+    summary$conf_champ[index] = summary$conf_champ[index] + 1
+  }
+  
+
+  index = which(season_stats$team == champion$team)
+  summary$championships[index] = summary$championships[index] + 1
+  histories[i,] = season_stats$wins
+}
+
+# find average number of wins across all iterations
+summary$average_wins = summary$average_wins/iterations
+summary
+```
+
+```{r}
+# select teams we are interested in
+summary<-summary[1:32,]
+win.df<-left_join(summary, total.wins, by = "team")
+# Create residuals for win totals
+win.df<-win.df%>%
+  mutate(resids=actual_wins-average_wins)
+# View the over/underachievers
+win.df%>%
+  select(team,resids)%>%
+  arrange(resids)
+win.df%>%
+  select(team,resids)%>%
+  arrange(desc(resids))
+```
+We can see that the Dolphins underachieved the most, by about 4.27 games.
+The Patriots overachieved the most, by about 3.78 games.
+
+```{r}
+# Select data we want to represent in powerpoint
+win.df%>%
+  select(team,average_wins,actual_wins,resids)
+library(ggplot2)
+win.df<-left_join(win.df,team_info, by = "team")
+win.df<-win.df%>%
+  select(-inaugural_season,-rating)
+
+# Make boxplots of simulated wins and actual wins by conference
+ggplot(data=win.df,aes(x=actual_wins,y=conference.x,color=conference.x))+
+  geom_boxplot()+
+  xlab("Actual Wins")+
+  ylab("Conference")+ theme(legend.position = "none",axis.text = element_text(size = 15)) 
+
+ggplot(data=win.df,aes(x=average_wins,y=conference.x,color=conference.x))+
+  geom_boxplot()+
+  xlab("Simulated Wins")+
+  ylab("Conference")+ theme(legend.position = "none",axis.text = element_text(size = 15))
+
+```
+```{r}
+# analyze residuals
+win.df%>%
+  arrange(resids)
+left_join(summary,season_stats, by="team")%>%
+  left_join(.,initial.elos,by="team")%>%
+  rename(preseason.rating=rating.y)%>%
+  rename(final.rating=rating.x)%>%
+  select(team,playoffs,division_titles,conf_champ,championships,preseason.rating,final.rating)
+
+```
+```{r,warning=FALSE}
+#Look at quarter back rating
+qb_stats <- read.csv("/Users/celestepicone/OneDrive - University of Pittsburgh/STAT 1341 - Sports Analytics/QB_stats-2007.csv",header=TRUE, sep=",")
+
+# Select all quarterbacks with at least 100 attempts
+qual = qb_stats[which(qb_stats$attempts >= 100),]
+
+
+# Select all quarterbacks with at least 4 decisions
+qual = qual[which(qual$GS >= 4),]
+qual<-qual%>%mutate(win.perc=wins/(wins+losses)*100)
+
+qb_summary<-qual%>%
+  select(team, total_qbr)
+qb_summary<-aggregate(.~team, data=qb_summary,mean)%>%
+  arrange(total_qbr)
+qb_summary<-left_join(qb_summary,win.df,by="team")
+qb_summary<-qb_summary%>%
+  mutate(wins=actual_wins,losses=16-actual_wins)%>%
+  select(team,total_qbr,wins,losses)%>%
+  mutate(win.perc=(wins/(wins+losses))*100)
+
+plot(win.perc~total_qbr , xlab = "Total QBR", ylab = "Win Percentage",data=qb_summary,pch=16,col= ifelse(win.perc == 100, "red", ifelse(win.perc ==6.25,"light blue", ifelse(win.perc ==50& total_qbr==54,"green","black"))))
+text(win.perc~total_qbr, labels=team,data=qb_summary, cex=0.43, font=3,pos=1)
+
+
+cor(qb_summary$total_qbr, qb_summary$win.perc)
+cor(qb_summary$total_qbr, qb_summary$wins)
+
+
+
+
+#Mean
+hist(qb_summary$total_qbr,breaks=10,main="Histogram of Team Average Total QBR",xlab="Team Average Total QBR",ylim=c(-.25,6))
+abline(v=mean(qb_summary[,2]),col="black",lwd=4)
+text(51.2,-.25,"Mean")
+
+# Eagles
+hist(qb_summary$total_qbr,breaks=10,main="Histogram of Team Average Total QBR",xlab="Team Average Total QBR",ylim=c(-.25,6))
+text(56,-.25,"Eagles")
+abline(v=qb_summary[17,2],col="#004C54",lwd=4)
+abline(v=mean(qb_summary[,2]),col="black",lwd=4)
+text(51.2,-.25,"Mean")
+
+# Dolphins
+hist(qb_summary$total_qbr,breaks=10,main="Histogram of Team Average Total QBR",xlab="Team Average Total QBR",ylim=c(-.25,6))
+abline(v=qb_summary[3,2],col="orange",lwd=4)
+text(30.50,-.25,"Dolphins")
+abline(v=mean(qb_summary[,2]),col="black",lwd=4)
+text(51.2,-.25,"Mean")
+
+#Patriots
+hist(qb_summary$total_qbr,breaks=10,main="Histogram of Team Average Total QBR",xlab="Team Average Total QBR",ylim=c(-.25,6))
+abline(v=qb_summary[32,2],col="#C60C30",lwd=4)
+text(83.3,-.25,"Patriots")
+abline(v=mean(qb_summary[,2]),col="black",lwd=4)
+text(51.2,-.25,"Mean")
+
+```
+```{r}
+library(tidyr)
+def_stats <- read.table("/Users/celestepicone/OneDrive - University of Pittsburgh/STAT 1341 - Sports Analytics/2007_def_stats.csv",header=TRUE, sep=",")
+def_stats<-def_stats[1:32,]
+def_stats<-left_join(def_stats,win.df,by='team')%>%
+  rename(wins=actual_wins)%>%
+  mutate(losses=16-wins,win.perc=(wins/(wins+losses))*100)%>%
+  select(-playoffs,-division_titles,-conf_champ,-resids,-conference,-championships,-division,-average_wins)
+#Look at defensive statistics
+(summary(def_stats[,-c(1,2)]))
+
+# POINTS ALLOWED
+
+#mean
+hist(def_stats$PA,breaks=20,main="Histogram of Points Allowed",xlab=" Points Allowed",ylim=c(-.25,6),xlim=c(250,480))
+abline(v=mean(def_stats[,4]),col="black",lwd=4)
+text(340,-.25,"Mean")
+#eagles
+hist(def_stats$PA,breaks=20,main="Histogram of Points Allowed",xlab=" Points Allowed",ylim=c(-.25,6),xlim=c(250,480))
+abline(v=def_stats[26,4],col="#004C54",lwd=4)
+text(290,-.25,"Eagles")
+abline(v=mean(def_stats[,4]),col="black",lwd=4)
+text(340,-.25,"Mean")
+#dolphins
+hist(def_stats$PA,breaks=20,main="Histogram of Points Allowed",xlab=" Points Allowed",ylim=c(-.25,6),xlim=c(250,480))
+abline(v=def_stats[20,4],col="orange",lwd=4)
+text(425,-.25,"Dolphins")
+abline(v=mean(def_stats[,4]),col="black",lwd=4)
+text(340,-.25,"Mean")
+#patriots
+hist(def_stats$PA,breaks=20,main="Histogram of Points Allowed",xlab=" Points Allowed",ylim=c(-.25,6),xlim=c(250,480))
+abline(v=def_stats[22,4],col="#C60C30",lwd=4)
+text(264,-.25,"Patriots")
+abline(v=mean(def_stats[,4]),col="black",lwd=4)
+text(340,-.25,"Mean")
+
+
+#PERCENT OF OFFENSIVE DRIVES ENDING IN SCORES
+#mean
+hist(def_stats$Sc.,breaks=20,main="Histogram of Percentage of Opponent’s Offensive Drives Resulting in Scores",xlab="Percentage of Opponent’s Offensive Drives Resulting in Scores",ylim=c(-.25,6))
+abline(v=mean(def_stats[,19]),col="black",lwd=4)
+text(31.6,-.25,"Mean")
+#eagles
+hist(def_stats$Sc.,breaks=20,main="Histogram of Percentage of Opponent’s Offensive Drives Resulting in Scores",xlab="Percentage of Opponent’s Offensive Drives Resulting in Scores",ylim=c(-.25,6))
+abline(v=def_stats[26,19],col="#004C54",lwd=4)
+text(29.8,-.25,"Eagles")
+abline(v=mean(def_stats[,19]),col="black",lwd=4)
+text(31.6,-.25,"Mean")
+#dolphins
+hist(def_stats$Sc.,breaks=20,main="Histogram of Percentage of Opponent’s Offensive Drives Resulting in Scores",xlab="Percentage of Opponent’s Offensive Drives Resulting in Scores",ylim=c(-.25,6))
+abline(v=def_stats[20,19],col="orange",lwd=4)
+text(41.8,-.25,"Dolphins")
+abline(v=mean(def_stats[,19]),col="black",lwd=4)
+text(31.6,-.25,"Mean")
+#Patriots
+hist(def_stats$Sc.,breaks=20,main="Histogram of Percentage of Opponent’s Offensive Drives Resulting in Scores",xlab="Percentage of Opponent’s Offensive Drives Resulting in Scores",ylim=c(-.25,6))
+abline(v=def_stats[22,19],col="#C60C30",lwd=4)
+text(23,-.25,"Patriots")
+abline(v=mean(def_stats[,19]),col="black",lwd=4)
+text(31.6,-.25,"Mean")
+
+#YARDS ALLOWED
+#mean
+hist(def_stats$Yds,breaks=20,main="Histogram of Total Yards Allowed",xlab="Total Yards Allowed",ylim=c(-.25,6))
+abline(v=mean(def_stats[,5]),col="black",lwd=4)
+text(5150,-.25,"Mean")
+#eagles
+hist(def_stats$Yds,breaks=20,main="Histogram of Total Yards Allowed",xlab="Total Yards Allowed",ylim=c(-.25,6))
+abline(v=def_stats[26,5],col="#004C54",lwd=4)
+text(4900,-.25,"Eagles")
+abline(v=mean(def_stats[,5]),col="black",lwd=4)
+text(5150,-.25,"Mean")
+#dolphins
+hist(def_stats$Yds,breaks=20,main="Histogram of Total Yards Allowed",xlab="Total Yards Allowed",ylim=c(-.25,6))
+abline(v=def_stats[20,5],col="orange",lwd=4)
+text(5400,-.25,"Dolphins")
+abline(v=mean(def_stats[,5]),col="black",lwd=4)
+text(5150,-.25,"Mean")
+#Patriots
+hist(def_stats$Yds,breaks=20,main="Histogram of Total Yards Allowed",xlab="Total Yards Allowed",ylim=c(-.25,6))
+abline(v=def_stats[22,5],col="#C60C30",lwd=4)
+text(4500,-.25,"Patriots")
+abline(v=mean(def_stats[,5]),col="black",lwd=4)
+text(5150,-.25,"Mean")
+```
+
+```{r}
+
+
+plot(win.perc~Sc. , xlab = "Percentage of Opponent's Offensive Drives Resulting in Scores
+", ylab = "Win Percentage",data=def_stats,col= ifelse(win.perc == 100, "red", ifelse(win.perc ==6.25,"light blue", ifelse(win.perc ==50& Sc.==30.5,"green","black"))),pch=16)
+text(win.perc~Sc., labels=team,data=def_stats, cex=0.43, font=3,pos=1)
+
+plot(win.perc~PA, xlab = "Points Allowed", ylab = "Win Percentage",data=def_stats,col=  ifelse(win.perc == 100, "red", ifelse(win.perc ==6.25,"light blue", ifelse(win.perc ==50& PA==300,"green","black"))),pch=16)
+text(win.perc~PA, labels=team,data=def_stats, cex=0.43, font=3, pos=1)
+
+plot(win.perc~Yds, xlab = "Total Yards Allowed", ylab = "Win Percentage",data=def_stats,col=  ifelse(win.perc == 100, "red", ifelse(win.perc ==6.25,"light blue", ifelse(win.perc ==50& Yds==4982,"green","black"))),pch=16)
+text(win.perc~Yds, labels=team,data=def_stats, cex=0.43, font=3, pos=1)
+
+
+as.data.frame(cor(def_stats[-2], def_stats$win.perc) )%>%
+  arrange(abs(V1))%>%
+  rename(Correlation_with_Wins=V1)
+
+# Win percentage has the highest correlation with percentage of drives resulting in offensive score,points allowed, and total yards gained by offense.
+```
+```{r}
+# Look at offensive statistics
+off_stats <- read.table("/Users/celestepicone/OneDrive - University of Pittsburgh/STAT 1341 - Sports Analytics/2007_off_stats.csv", header=TRUE, sep=",")
+off_stats<-left_join(off_stats,win.df,by='team')%>%
+  rename(wins=actual_wins)%>%
+  mutate(losses=16-wins)%>%
+  select(-playoffs,-division_titles,-conf_champ,-resids,-conference,-championships,-division,-average_wins)
+off_stats
+
+off_stats %>%
+  gather(-wins, -team, key = "var", value = "value") %>% 
+  ggplot(aes(x = value, y = wins, color = team)) +
+    geom_point() +
+    facet_wrap(~ var, scales = "free") +
+    theme_bw()
+as.data.frame(cor(off_stats[-1], off_stats$wins) )%>%
+  arrange(abs(V1))%>%
+  rename(Correlation_with_Wins=V1)
+
+
+library(e1071)
+hist(histories$`Philadelphia Eagles`,breaks=10,xlab="Win Totals")
+hist(histories$`Miami Dolphins`,breaks=10,xlab="Win Totals")
+hist(histories$`New England Patriots`,breaks=10,xlab="Win Totals")
+skewness(histories$`Philadelphia Eagles`)
+skewness(histories$`Miami Dolphins`)
+skewness(histories$`New England Patriots`)
+# Not a lot of correlation between any offensive variables and wins
+```
+Analysis of difference from mean
+```{r}
+#eagles different from mean
+t.test(qb_summary$total_qbr, mu = qb_summary$total_qbr[17], alternative = "two.sided")
+#fail to reject the null and conclude the values are not significantly different
+t.test(def_stats$Sc., mu = def_stats$Sc.[26], alternative = "two.sided")
+#fail to reject the null and conclude the values are not significantly different
+t.test(def_stats$Yds, mu = def_stats$Yds[26], alternative = "two.sided")
+
+t.test(def_stats$PA, mu = def_stats$PA[26], alternative = "two.sided")
+
+#patriots different from mean
+t.test(qb_summary$total_qbr, mu = qb_summary$total_qbr[32], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+t.test(def_stats$Sc., mu = def_stats$Sc.[22], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+t.test(def_stats$Yds, mu = def_stats$Yds[22], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+t.test(def_stats$PA, mu = def_stats$PA[22], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+
+#dolphins different from mean
+t.test(qb_summary$total_qbr, mu = qb_summary$total_qbr[3], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+t.test(def_stats$Sc., mu = def_stats$Sc.[20], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+t.test(def_stats$Yds, mu = def_stats$Yds[20], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+t.test(def_stats$PA, mu = def_stats$PA[20], alternative = "two.sided")
+#reject the null and conclude the values are significantly different
+```
+
+Graphs of Elos
+```{r}
+
+weight = 18.3
+hfa = 54.87
+
+# Select patriots for the 2007 season
+team = c("New England Patriots")
+first_season = 2007
+last_season = 2007
+
+# Read in data
+elos<-read.csv("/Users/celestepicone/Downloads/nfl_initial_elos.csv",header=TRUE)
+scores<- read.csv("/Users/celestepicone/Downloads/nfl_scores.csv", header=TRUE, row.names="id")
+
+# Create data frame to store information for the patriots
+team_results = data.frame(matrix(ncol = 8, nrow = 0))
+colnames(team_results) = c("opponent", "pregame_elo", "win_probability", "result", "team_score", "opponent_score", "elo_adjustment", "postgame_elo")
+
+# Iterate through all games in the nfl history
+for(i in 1:nrow(scores)) {
+  # Find indices corresponding to home and away teams for current game
+  home_index = which(elos$team == scores$home_team[i])
+  away_index = which(elos$team == scores$away_team[i])
+  
+  # Find home and away team Elo
+  home_elo = elos$rating[home_index]
+  away_elo = elos$rating[away_index]
+
+  # Calculate home team win probability
+  win_prob = 1 / (10^((away_elo - (home_elo + hfa*scores$neutral[i]))/400) + 1)
+
+  # Calculate actual margin of victory
+  score_diff = abs(scores$home_score[i] - scores$away_score[i])   
+  
+  # Determine home team result
+  if(scores$home_score[i] > scores$away_score[i]) { 
+    home_result = 1  #  wins
+  } else if(scores$home_score[i] < scores$away_score[i]) { 
+    home_result = 0  #  loses
+  } else { 
+    home_result = 0.5  # Tie
+  }
+  
+  # Calculate amount each team's Elo rating is adjusted by
+  home_elo_adjustment = weight * log(score_diff + 1) * (home_result - win_prob)
+  
+  # Adjust Elo ratings
+  elos$rating[home_index] = elos$rating[home_index] + home_elo_adjustment
+  elos$rating[away_index] = elos$rating[away_index] - home_elo_adjustment
+  
+  # Add game information to team result data frame for each team game of the patriots if team and season both match
+  if(scores$season[i] >= first_season & scores$season[i] <= last_season & (scores$home_team[i] == team | scores$away_team[i] == team)) {
+    if(scores$home_team[i] == team) { 
+      team_results[nrow(team_results) + 1,] = c(scores$away_team[i], elos$rating[home_index] - home_elo_adjustment, win_prob, home_result, scores$home_score[i], scores$away_score[i], home_elo_adjustment, elos$rating[home_index])
+    } else {  
+      team_results[nrow(team_results) + 1,] = c(scores$home_team[i], elos$rating[away_index] + home_elo_adjustment, 1-win_prob, 1-home_result, scores$away_score[i], scores$home_score[i], -1*home_elo_adjustment, elos$rating[away_index])
+    }
+  }
+  
+  # Adjust Elo ratings at end of season 1/3 of the way towards 1500
+  if(i < nrow(scores) && scores$season[i+1] > scores$season[i]) { 
+    for(j in 1:nrow(elos)) {  
+      if(scores$season[i] >= elos$inaugural_season[j]) {  
+        # Move Elo ratings back towards 1500 by 1/3 of the difference
+        elos$rating[j] = elos$rating[j] - (elos$rating[j] - 1500)/3
+      }
+    }
+    
+    # Identify the teams that existed at beginning of next season
+    existing_teams = elos[which(elos$inaugural_season <= (scores$season[i] + 1)),]
+    
+    # Calculate amount each team's Elo rating must be adjusted by to make mean 1500
+    expansion_adjustment = -1*(mean(existing_teams$rating) - 1500)
+    
+    # expansion adjustment for teams that existed at beginning of next season
+    for(j in 1:nrow(elos)) { 
+      if((scores$season[i] + 1) >= elos$inaugural_season[j]) {
+        elos$rating[j] = elos$rating[j] + expansion_adjustment 
+      }
+    }
+  }
+}
+
+# plot patriots ratings
+plot(team_results$postgame_elo, type = "l", xlab = paste(first_season, team), ylab = "Elo Rating")
+```
+
+
+```{r}
+
+weight = 18.3
+hfa = 54.87
+
+# Select dolphins for the 2007 season
+team = c("Miami Dolphins")
+first_season = 2007
+last_season = 2007
+
+# Read in data
+elos<-read.csv("/Users/celestepicone/Downloads/nfl_initial_elos.csv",header=TRUE)
+scores<- read.csv("/Users/celestepicone/Downloads/nfl_scores.csv", header=TRUE, row.names="id")
+
+# Create data frame to store information for the dolphins
+team_results = data.frame(matrix(ncol = 8, nrow = 0))
+colnames(team_results) = c("opponent", "pregame_elo", "win_probability", "result", "team_score", "opponent_score", "elo_adjustment", "postgame_elo")
+
+# Iterate through all games in the nfl history
+for(i in 1:nrow(scores)) {
+  # Find indices corresponding to home and away teams for current game
+  home_index = which(elos$team == scores$home_team[i])
+  away_index = which(elos$team == scores$away_team[i])
+  
+  # Find home and away team Elo
+  home_elo = elos$rating[home_index]
+  away_elo = elos$rating[away_index]
+
+  # Calculate home team win probability
+  win_prob = 1 / (10^((away_elo - (home_elo + hfa*scores$neutral[i]))/400) + 1)
+
+  # Calculate actual margin of victory
+  score_diff = abs(scores$home_score[i] - scores$away_score[i])   
+  
+  # Determine home team result
+  if(scores$home_score[i] > scores$away_score[i]) { 
+    home_result = 1  #  wins
+  } else if(scores$home_score[i] < scores$away_score[i]) { 
+    home_result = 0  #  loses
+  } else { 
+    home_result = 0.5  # Tie
+  }
+  
+  # Calculate amount each team's Elo rating is adjusted by
+  home_elo_adjustment = weight * log(score_diff + 1) * (home_result - win_prob)
+  
+  # Adjust Elo ratings
+  elos$rating[home_index] = elos$rating[home_index] + home_elo_adjustment
+  elos$rating[away_index] = elos$rating[away_index] - home_elo_adjustment
+  
+  # Add game information to team result data frame for each team game of the dolphins if team and season both match
+  if(scores$season[i] >= first_season & scores$season[i] <= last_season & (scores$home_team[i] == team | scores$away_team[i] == team)) {
+    if(scores$home_team[i] == team) { 
+      team_results[nrow(team_results) + 1,] = c(scores$away_team[i], elos$rating[home_index] - home_elo_adjustment, win_prob, home_result, scores$home_score[i], scores$away_score[i], home_elo_adjustment, elos$rating[home_index])
+    } else {  
+      team_results[nrow(team_results) + 1,] = c(scores$home_team[i], elos$rating[away_index] + home_elo_adjustment, 1-win_prob, 1-home_result, scores$away_score[i], scores$home_score[i], -1*home_elo_adjustment, elos$rating[away_index])
+    }
+  }
+  
+  # Adjust Elo ratings at end of season 1/3 of the way towards 1500
+  if(i < nrow(scores) && scores$season[i+1] > scores$season[i]) { 
+    for(j in 1:nrow(elos)) {  
+      if(scores$season[i] >= elos$inaugural_season[j]) {  
+        # Move Elo ratings back towards 1500 by 1/3 of the difference
+        elos$rating[j] = elos$rating[j] - (elos$rating[j] - 1500)/3
+      }
+    }
+    
+    # Identify the teams that existed at beginning of next season
+    existing_teams = elos[which(elos$inaugural_season <= (scores$season[i] + 1)),]
+    
+    # Calculate amount each team's Elo rating must be adjusted by to make mean 1500
+    expansion_adjustment = -1*(mean(existing_teams$rating) - 1500)
+    
+    # expansion adjustment for teams that existed at beginning of next season
+    for(j in 1:nrow(elos)) { 
+      if((scores$season[i] + 1) >= elos$inaugural_season[j]) {
+        elos$rating[j] = elos$rating[j] + expansion_adjustment 
+      }
+    }
+  }
+}
+
+# plot dolphins ratings
+plot(team_results$postgame_elo, type = "l", xlab = paste(first_season, team), ylab = "Elo Rating")
+```
+
+
+```{r}
+
+weight = 18.3
+hfa = 54.87
+
+# Select eagles for the 2007 season
+team = c("Philadelphia Eagles")
+first_season = 2007
+last_season = 2007
+
+# Read in data
+elos<-read.csv("/Users/celestepicone/Downloads/nfl_initial_elos.csv",header=TRUE)
+scores<- read.csv("/Users/celestepicone/Downloads/nfl_scores.csv", header=TRUE, row.names="id")
+
+# Create data frame to store information for the eagles
+team_results = data.frame(matrix(ncol = 8, nrow = 0))
+colnames(team_results) = c("opponent", "pregame_elo", "win_probability", "result", "team_score", "opponent_score", "elo_adjustment", "postgame_elo")
+
+# Iterate through all games in the nfl history
+for(i in 1:nrow(scores)) {
+  # Find indices corresponding to home and away teams for current game
+  home_index = which(elos$team == scores$home_team[i])
+  away_index = which(elos$team == scores$away_team[i])
+  
+  # Find home and away team Elo
+  home_elo = elos$rating[home_index]
+  away_elo = elos$rating[away_index]
+
+  # Calculate home team win probability
+  win_prob = 1 / (10^((away_elo - (home_elo + hfa*scores$neutral[i]))/400) + 1)
+
+  # Calculate actual margin of victory
+  score_diff = abs(scores$home_score[i] - scores$away_score[i])   
+  
+  # Determine home team result
+  if(scores$home_score[i] > scores$away_score[i]) { 
+    home_result = 1  #  wins
+  } else if(scores$home_score[i] < scores$away_score[i]) { 
+    home_result = 0  #  loses
+  } else { 
+    home_result = 0.5  # Tie
+  }
+  
+  # Calculate amount each team's Elo rating is adjusted by
+  home_elo_adjustment = weight * log(score_diff + 1) * (home_result - win_prob)
+  
+  # Adjust Elo ratings
+  elos$rating[home_index] = elos$rating[home_index] + home_elo_adjustment
+  elos$rating[away_index] = elos$rating[away_index] - home_elo_adjustment
+  
+  # Add game information to team result data frame for each team game of the eagles if team and season both match
+  if(scores$season[i] >= first_season & scores$season[i] <= last_season & (scores$home_team[i] == team | scores$away_team[i] == team)) {
+    if(scores$home_team[i] == team) { 
+      team_results[nrow(team_results) + 1,] = c(scores$away_team[i], elos$rating[home_index] - home_elo_adjustment, win_prob, home_result, scores$home_score[i], scores$away_score[i], home_elo_adjustment, elos$rating[home_index])
+    } else {  
+      team_results[nrow(team_results) + 1,] = c(scores$home_team[i], elos$rating[away_index] + home_elo_adjustment, 1-win_prob, 1-home_result, scores$away_score[i], scores$home_score[i], -1*home_elo_adjustment, elos$rating[away_index])
+    }
+  }
+  
+  # Adjust Elo ratings at end of season 1/3 of the way towards 1500
+  if(i < nrow(scores) && scores$season[i+1] > scores$season[i]) { 
+    for(j in 1:nrow(elos)) {  
+      if(scores$season[i] >= elos$inaugural_season[j]) {  
+        # Move Elo ratings back towards 1500 by 1/3 of the difference
+        elos$rating[j] = elos$rating[j] - (elos$rating[j] - 1500)/3
+      }
+    }
+    
+    # Identify the teams that existed at beginning of next season
+    existing_teams = elos[which(elos$inaugural_season <= (scores$season[i] + 1)),]
+    
+    # Calculate amount each team's Elo rating must be adjusted by to make mean 1500
+    expansion_adjustment = -1*(mean(existing_teams$rating) - 1500)
+    
+    # expansion adjustment for teams that existed at beginning of next season
+    for(j in 1:nrow(elos)) { 
+      if((scores$season[i] + 1) >= elos$inaugural_season[j]) {
+        elos$rating[j] = elos$rating[j] + expansion_adjustment 
+      }
+    }
+  }
+}
+
+# plot eagles ratings
+plot(team_results$postgame_elo, type = "l", xlab = paste(first_season, team), ylab = "Elo Rating")
+
+```
